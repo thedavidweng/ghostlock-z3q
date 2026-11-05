@@ -337,11 +337,61 @@ serving channels to research next, in order:
    the first hop must come from the successor walk itself (F3 writes at
    `rb_parent(successor)+0x10`, which for a free object is the *next*
    free object's address).
-3. **DTB oracle**: `/proc/device-tree` serves DTB content (partially
-   SELinux-filtered); if the live DTB's phys is deterministic (abl load
-   address), its linear VA is one unknown-shift expression away — same
-   wall, but a write there is instantly user-visible, so it becomes the
-   readback target the moment any shift leak appears.
+3. **DTB oracle**: DEAD — /proc/device-tree property reads are fully
+   SELinux-denied for shell on this build (even `/model`).
+
+## §7 The address-space truth (2026-11-05 device session)
+
+The prefetch probe (`tools/prefetch_probe.c`, EL0 `prfm` TLB-timing,
+zero crash risk) resolved the whole address-space question empirically:
+
+* **The kernel is a VA39 build.** `PAGE_OFFSET = 0xffffffc000000000`
+  (= `0xffffffffffffffff - 2^38 + 1`), not the VA48 value
+  0xffffff8000000000 that earlier runs assumed. The vmalloc/image region
+  is `[0xffffff8000000000, 0xffffffc000000000)`, `vmemmap = 0xffffffbf00000000`
+  (= PAGE_OFFSET - 4GB; probed hot 12/12 — struct pages are touched
+  constantly). **All five earlier panics are fully explained**: every
+  planted "alias" VA sat ~264GB from any mapping, so the first rt_mutex
+  walk deref faulted. The offsets were always right; only the base was
+  wrong (the target.h comment even said "VA_BITS_39" while carrying the
+  VA48 constant).
+* **KASLR slide is per-boot random, and the prefetch oracle finds it in
+  seconds.** No KPTI on Cortex-A77, so kernel mappings live in every
+  user process's TTBR1 tables; a 64-PRFM burst times ~5 when the page is
+  mapped (first PRFM fills the TLB even from EL0, the rest hit) vs 14-22
+  when every PRFM's walk fails. Caveats learned the hard way: the image
+  link base is 0x80000 into its 2MB block (probe `link + off + s*2MB`,
+  never a 2MB grid), and `.text` pages are invisible to a data prefetch
+  (I-only for EL0 D-prefetch on this core; the exception-vectors probe
+  finds nothing). The working probe pages are **rodata/RW data**: the
+  sys_call_table page (`_text+0x1980000`, read on every syscall) and the
+  jiffies page (`_text+0x2b87000`, read every tick). The slide = the
+  lowest dual-confirmed hypothesis: image text (18MB) is D-cold, so the
+  first mapped non-text page above the probe floor is exactly the sct
+  page of the true slide.
+* This oracle is now integrated into the exploit's slide stage
+  (`slide_oracle_find_slide()`), and all gadget targets are link VAs +
+  per-boot slide. Boot-id gadget targets (all RELA-verified):
+  `random_table[boot_id].data` slot = `_text+0x2c4d998`, `&loggers[0][0]`
+  = `_text+0x2ba5dc8`, `&memstart_addr` = `_text+0x24404c0`
+  (`__ro_after_init` — readable but W2 would write it, so the readback
+  serves loggers instead; `kimage_voffset` = `_text+0x24404d0`).
+* **memstart draw bounded**: the hot-heap cluster spans
+  `[PO+0.78G, PO+10.98G]`, bounding the per-boot memstart shift to a
+  tiny draw (2-3 GB range) on that boot. Exact value still needs a read
+  primitive; W1/W2 values are constrained to kernel VAs (W1's value P
+  must be readable and P+8 writable, W2's value C must be a writable
+  VA since W1 writes at C first), so memstart cannot be served directly.
+
+**The remaining blocker (after run #8, 2026-11-05):** with the slide
+oracle working and every planted VA verified mapped, the choreography
+still panics at the same point — during the futex/pselect waiter race,
+before any gadget write logs. Conclusion: the pselect fd_set copy does
+not land on the dangling rt_mutex_waiter at the assumed offsets on this
+build. Next step is offline: disassemble z3q's `futex_wait_requeue_pi`
+and `core_sys_select` frames in the vmlinux, derive the exact
+stack-offset mapping from waiter fields to fd_set words, and fix
+`PSELECT_WAITER_WORD_SHIFT` / the word table accordingly.
 
 Proposed sequence (open design work):
 

