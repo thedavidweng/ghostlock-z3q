@@ -383,15 +383,49 @@ zero crash risk) resolved the whole address-space question empirically:
   must be readable and P+8 writable, W2's value C must be a writable
   VA since W1 writes at C first), so memstart cannot be served directly.
 
-**The remaining blocker (after run #8, 2026-11-05):** with the slide
+**The remaining blocker (after runs #6-9, 2026-11-05):** with the slide
 oracle working and every planted VA verified mapped, the choreography
-still panics at the same point — during the futex/pselect waiter race,
-before any gadget write logs. Conclusion: the pselect fd_set copy does
-not land on the dangling rt_mutex_waiter at the assumed offsets on this
-build. Next step is offline: disassemble z3q's `futex_wait_requeue_pi`
-and `core_sys_select` frames in the vmlinux, derive the exact
-stack-offset mapping from waiter fields to fd_set words, and fix
-`PSELECT_WAITER_WORD_SHIFT` / the word table accordingly.
+still panics at the waiter race. The stack geometry is now fully
+disasm-derived and explains every run:
+
+```
+waiter (do_futex inlined rt_waiter @SP0-0x190)   chain: sys_futex 0x70
+                                                 + do_futex 0x1e0, waiter +0xc0
+pselect fd buf  (@SP0-0x210)                     chain: pselect6 0xa0
+                                                 + core_sys_select 0x1c0, buf +0x50
+DELTA = 0x80  ->  waiter field F = fdset word (0x80+F)/8:
+  tree_entry.parent_color = word 10   .rb_right = 11   .rb_left = 12
+  pi_tree_entry.parent_color = 13     .rb_right = 14   .rb_left = 15 (res_out, unplantable)
+  waiter->task = word 22, waiter->lock = word 23      (res_ex, unplantable)
+```
+
+The k40 word table put wake_state(3) on word 13 = pi_tree parent_color,
+so the pi erase read [0x13] and panicked instantly — that was the
+identical crash signature of ALL earlier runs (the wrong-PO runs never
+even reached it). The corrected table (words 10-14) survives until the
+erase path touches the stale `task`/`lock`/`pi_left` fields, which sit
+past the 15-word plantable window (3 user fd sets x 5 words = 120
+bytes; the stack_fds cap of 256 bytes for 6 sets makes 6 words/set
+impossible — larger nfds pushes the buffers to the heap and kills the
+overlay entirely).
+
+**Conclusion: the pselect overlay route cannot plant the full waiter on
+this build.** Next-step options, ranked:
+
+1. **Alternate overlay syscall**: need fully-controlled 64-bit qwords
+   landing in [SP0-0x198, SP0-0x148] (waiter+0x0..+0x50). writev's
+   iovstack lands too shallow (SP0-0x150+off), sendmmsg's ___sys_sendmsg
+   frame too deep (SP0-0x380). A systematic per-syscall frame audit of
+   copy_from_user-on-stack syscalls is the bounded way to find one.
+2. **Pre-seed combo**: a prior syscall leaving C at SP0-0x168
+   (pi_left), racing the erase into the fdset-copy phase before
+   do_select zeroes the res buffers — microsecond window, fragile.
+3. **Heap-waiter route**: reclaim the waiter into a heap object the
+   exploit controls (the upstream GhostLock heap route).
+4. **vmemmap/pipe-readback chain of §6.5** — now with the correct VA39
+   constants (PAGE_OFFSET 0xffffffc000000000) the vmemmap math is fully
+   computable, and the slide oracle already removes the biggest unknown
+   that motivated it.
 
 Proposed sequence (open design work):
 

