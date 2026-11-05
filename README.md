@@ -32,16 +32,24 @@ for the full chain of evidence.
 | KernelSnitch mm leak | **dead on this device** — strongest-ever negative result, §6.2 |
 | per-attempt failure mode | kernel panic → auto-reboot (CONFIG_PANIC_ON_OOPS=y), retry |
 
-**Current blocker (2026-11)**: the exploit chain needs one kernel VA per boot
-(virtual slide or linear-map base) before any gadget can be planted. Samsung
-seeds KASLR via the Knox `set_kaslr_flag` secapp, the kernel runs from a fixed
-physical slot (`reserved-memory/kaslr_region@A0001000`, verified stable across
-reboots) — but the 4.19-era `memstart_offset_seed` randomization moves the
-whole linear map per boot, every userspace leak channel is SELinux-blocked,
-and the mm side channel is disproven. Fixed-address planting panics on the
-first deref. Next direction: the **vmemmap route** (§6.5) — struct-page VAs
-are pure phys arithmetic and KASLR-independent. Full evidence chain and
-roadmap in [docs/PORTING.md §6](docs/PORTING.md).
+**Update 2026-11-05** — the blocker moved twice, and the address-space question is
+now **solved** (details in [docs/OPEN_PROBLEM.md](docs/OPEN_PROBLEM.md) and
+PORTING.md §7):
+
+- The kernel is a **VA39** build (`PAGE_OFFSET = 0xffffffc000000000`); every early
+  panic traced to a wrong VA48 base, not the randomization.
+- The per-boot KASLR slide is measurable in seconds from unprivileged userspace via
+  an **EL0 prefetch TLB-timing oracle** (`tools/prefetch_probe.c`, integrated into
+  the slide stage) — no leak channel needed, no KernelSnitch.
+- The pselect stack overlay is **geometrically impossible** on this build
+  (disasm-derived); the replacement **setsockopt-MCAST stamp** covers the entire
+  dangling waiter.
+
+**Current blocker**: the erase-trigger timing — the write primitive, gadget
+targets, geometry and readback are all in place; the remaining question is which
+kernel path erases the dangling waiter and whether its consumer set fits the
+planted fields. The precise open problem, full geometry tables and reproduction
+package: **[docs/OPEN_PROBLEM.md](docs/OPEN_PROBLEM.md)**.
 
 ## Why this repo exists
 
