@@ -266,26 +266,82 @@ whole reserved-memory table, all DTB-known regions). Design work first.
 
 **The constrained write, decoded.** The pselect stack-copy plants an
 `rt_mutex_waiter` whose `tree_entry` / `pi_tree_entry` fields we choose.
-During dequeue the kernel erases both rb entries; with `rb_right == NULL`
-and `rb_left != NULL`, `____rb_erase` performs exactly two stores per
-entry, both fully controlled (`P` = `rb_parent_color`, kept even so the
-color bit is zero; `C` = `rb_left`, nonzero):
+Each entry is erased during dequeue; `____rb_erase` gives a different
+choreography per child pattern (fields: `P` = `rb_parent_color`, kept even
+so the color bit is zero; `R` = `rb_right`, `L` = `rb_left`):
+
+*Simple path (`R == NULL, L != NULL`)* — two fully controlled stores:
 
 ```
-W1: *(u64 *)C       = P        (rb_set_parent_color: [child] = parent)
-W2: *(u64 *)(P + 8) = C        (__rb_change_child else-branch: the parent's
-                                rb_left compare can never match our stack
-                                node, so rb_right is written unconditionally)
+W1: *(u64 *)L   = P        (rb_set_parent_color: [child] = parent)
+W2: *(u64 *)(P+8) = L       (__rb_change_child else-branch: the parent's
+                             rb_left compare can never match the stack
+                             waiter, so rb_right is written unconditionally)
 ```
 
-That is the entire trick behind the boot_id gadget (W1 with `C` = the
-ctl_table `.data` slot and `P` = `&loggers[0][0]`), and it means the
-z3q chain has **two arbitrary aligned qword writes with controlled target
-and value per dequeue pass** — stronger than a single constrained write,
-and the exact primitive to aim at struct-page metadata. Note the
-prerequisite reads: the erase touches `[P + 0x10]` (compare) and the root
-pointer, so `P` must be readable kernel VA; under the per-boot randomized
-linear map the only guaranteed-computable `P`/`C` space is the vmemmap.
+That is the entire trick behind the boot_id gadget (W1 with `L` = the
+ctl_table `.data` slot and `P` = `&loggers[0][0]`).
+
+*Both-children path (`R != NULL, L != NULL`)* — the kernel walks
+`successor = R; while (s->rb_left) s = s->rb_left;` **reading kernel
+memory**, then performs kernel-derived stores, including:
+
+```
+E1: *(u64 *)L        = successor        ← kernel-read value EXFILTRATED
+                                            to an arbitrary chosen VA
+E2: *(u64 *)(R+0)    = successor        ← second exfil, second target
+E3: *(u64 *)(P+8)    = successor        ← third exfil, third target
+F1: *(u64 *)(successor+0x10) = L        ← our controlled value written INTO
+F2: *(u64 *)(successor+0x8)  = R        ← a kernel-read-reached free object
+F3: *(u64 *)(rb_parent(successor)+0x10) = successor->rb_right   (kernel→kernel)
+```
+
+So the primitive is stronger than a plain constrained write: it is a
+**kernel-memory read/exfiltrate + free-object planting** choreography. If
+the successor walk is steered to terminate inside a SLUB free object (the
+walk reads `[s+0x10]`; for a SLUB page's struct page, `+0x10` is
+`page->freelist` — a raw linear-VA pointer), E1-E3 write that linear
+pointer to chosen targets and F1/F2 plant chosen qwords into the free
+object itself, which the allocator later hands out (kmalloc-1024 is the
+pipe-buffer cache on this kernel).
+
+Relevant config facts (device `/proc/config.gz`): SLUB with
+`SLAB_FREELIST_RANDOM` and `SLAB_FREELIST_HARDENED` both off — raw
+freelist pointers, no encoding; `SPARSEMEM_VMEMMAP` on; `PANIC_ON_OOPS=y`.
+
+Prerequisite for every planted `P`/`R`: `[P+0x10]`/`[R+0x10]` must be
+readable kernel VA. Under the per-boot randomized linear map the only
+guaranteed-computable P/R/L space is the vmemmap (struct pages of every
+physical address the device tree publishes) plus whatever early-memblock
+physical layout can be reconstructed offline (boot SLUB slabs, the kernel
+image at kaslr_region — phys 0xA0001000, page-table pages).
+
+**The remaining wall, precisely stated.** E1-E3 can copy kernel-derived
+pointers (linear VAs — the shift we need; slid image VAs — the slide we
+need) to any *known* VA, but no known VA is served to userspace, and
+plain kernel stores to user VAs fault under PAN. The boot_id sysctl was
+exactly such a serving channel and it needs the slide first. Candidate
+serving channels to research next, in order:
+
+1. **Free-object planting into pipe buffers**: F1/F2 seed controlled
+   qwords into a kmalloc-1024 free object; if the exploit allocates a
+   pipe at the right moment, the object becomes a `pipe_buffer[]` and
+   slot fields come from our plants plus stale freepointer content.
+   Open issues: `slot0.page` sits on the freepointer word (allocator-owned),
+   and a fake `ops` needs a slid text pointer — so the first usable variant
+   is steering the allocator to a *second* live pipe_buffer array rather
+   than forging one.
+2. **Freelist steering**: E1 (`[L] = successor`) with `L` = a free
+   object's freepointer word would graft the kernel-read successor into
+   the allocation chain — but free-object VAs are linear (unknown), so
+   the first hop must come from the successor walk itself (F3 writes at
+   `rb_parent(successor)+0x10`, which for a free object is the *next*
+   free object's address).
+3. **DTB oracle**: `/proc/device-tree` serves DTB content (partially
+   SELinux-filtered); if the live DTB's phys is deterministic (abl load
+   address), its linear VA is one unknown-shift expression away — same
+   wall, but a write there is instantly user-visible, so it becomes the
+   readback target the moment any shift leak appears.
 
 Proposed sequence (open design work):
 
