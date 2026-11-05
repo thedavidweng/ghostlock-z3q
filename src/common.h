@@ -418,7 +418,7 @@ void open_slide_selected_fds(
 void slide_pselect_stack_copy(void);
 int hex_value(char c);
 uint64_t slide_read_stext(void);
-uint64_t slide_child_leak_stext(void);
+void slide_child_leak_stext(void);
 int slide_leak_kernel_base(void);
 
 ssize_t configfs_write_once(
