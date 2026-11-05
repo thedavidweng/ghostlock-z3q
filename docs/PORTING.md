@@ -262,12 +262,35 @@ where this port is stuck.
 `VMEMMAP_START` is not randomized on 4.19, and the struct-page VA of any
 physical page is `vmemmap_start + (phys >> 12) * 0x40` — pure arithmetic on
 physical addresses, which z3q gives us in abundance (kaslr_region, the
-whole reserved-memory table, all DTB-known regions). The GhostLock
-constrained write can therefore target struct-page metadata with zero
-address guessing:
+whole reserved-memory table, all DTB-known regions). Design work first.
+
+**The constrained write, decoded.** The pselect stack-copy plants an
+`rt_mutex_waiter` whose `tree_entry` / `pi_tree_entry` fields we choose.
+During dequeue the kernel erases both rb entries; with `rb_right == NULL`
+and `rb_left != NULL`, `____rb_erase` performs exactly two stores per
+entry, both fully controlled (`P` = `rb_parent_color`, kept even so the
+color bit is zero; `C` = `rb_left`, nonzero):
 
 ```
-GhostLock write → vmemmap struct page (known phys → known VA)
+W1: *(u64 *)C       = P        (rb_set_parent_color: [child] = parent)
+W2: *(u64 *)(P + 8) = C        (__rb_change_child else-branch: the parent's
+                                rb_left compare can never match our stack
+                                node, so rb_right is written unconditionally)
+```
+
+That is the entire trick behind the boot_id gadget (W1 with `C` = the
+ctl_table `.data` slot and `P` = `&loggers[0][0]`), and it means the
+z3q chain has **two arbitrary aligned qword writes with controlled target
+and value per dequeue pass** — stronger than a single constrained write,
+and the exact primitive to aim at struct-page metadata. Note the
+prerequisite reads: the erase touches `[P + 0x10]` (compare) and the root
+pointer, so `P` must be readable kernel VA; under the per-boot randomized
+linear map the only guaranteed-computable `P`/`C` space is the vmemmap.
+
+Proposed sequence (open design work):
+
+```
+two controlled stores → vmemmap struct page (known phys → known VA)
   → Dirty-Pagetable-class primitive (page-table page metadata corruption,
     page reclaimed into attacker-controlled content)
   → PTE control from userspace → map arbitrary phys (kernel @0xA0001000)
@@ -278,8 +301,12 @@ GhostLock write → vmemmap struct page (known phys → known VA)
 ```
 
 Failure mode is also better: corrupting a wrong struct page is usually
-retryable, not the instant reboot that fixed-alias planting costs. Design
-work required: map the exact rb-erase write semantics onto a single
-`struct page` field store (value + target), then pick the page-table-page
-victim set from the early-memblock allocations whose physical addresses are
-deterministic.
+retryable, not the instant reboot that fixed-alias planting costs. Two
+open problems: (a) the readback channel — every store lands in kernel
+memory and userspace sees nothing until some kernel path follows the
+corrupted metadata back out (the boot_id sysctl was exactly such a
+channel; a vmemmap-era equivalent must be found, e.g. corrupting metadata
+that steers an allocation or a page-cache lookup into attacker-visible
+memory); (b) choosing the victim struct pages so the wrong-guess cost
+stays a WARN-free retry (PANIC_ON_OOPS=y makes refcount corruption of
+reserved pages potentially lethal).
