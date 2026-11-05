@@ -122,14 +122,39 @@ re-surveying GitHub. Ordered by what each layer is *for*.
 ### Samsung-specific porting and productization
 - [BuSung-dev/Root-My-Galaxy](https://github.com/BuSung-dev/Root-My-Galaxy) + 
   [Root-My-Galaxy-Payloads](https://github.com/BuSung-dev/Root-My-Galaxy-Payloads) — one-click
-  installer app + signed community payload feed (S20U-era Samsung not covered; newest kernel
-  in their feed is 5.10/5.15+). `docs/PORTING.md` there is the best Samsung firmware→profile
-  procedure, and the feed (`support/targets-v3.json`, schema v3) is the natural upstream for
-  a z3q payload PR.
+  installer app + signed community payload feed (`support/targets-v3.json`, schema v3) is the
+  natural upstream for a z3q payload PR. A Galaxy S20 Ultra Snapdragon support inquiry
+  ([issue #743](https://github.com/BuSung-dev/Root-My-Galaxy/issues/743), 2026-10) is still
+  open with no maintainer response — this device is genuinely unclaimed territory.
+- [wxxsfxyzm/GhostLock-Galaxy](https://github.com/wxxsfxyzm/GhostLock-Galaxy) — Galaxy branch of
+  the app lineage: Z Fold6 only (6.1), `extract_target.py` parses boot.img + **xbl_config.img**
+  and auto-derives `pselect_waiter_shift` via llvm-objdump — the best generator-side
+  route-feasibility check ("waiter start + 11 <= 14 or the route cannot work") in the ecosystem.
+- [snothin/GhostSam](https://github.com/snothin/GhostSam) — the most productized Samsung toolkit:
+  S22/S26/Z Fold8 (5.10-6.18) Ghostlock chains plus a **dirtyfrag** chain (CVE-2026-43284
+  xfrm-ESP page-cache store, GKI KMIs only). Its write-carrier design (misc/simple_attr fd as
+  the constrained-write target instead of a sprayed page) and KDP-free root stage
+  (forged `work_struct` on `system_unbound_wq` → `call_usermodehelper_exec_work`, no cred
+  writes) are both directly relevant to any later-stage redesign here.
+- [k-o-n-t-o-r/ghostlock-sm-g990b](https://github.com/k-o-n-t-o-r/ghostlock-sm-g990b) — S21 FE 5G
+  (5.4 qGKI, single firmware). The oldest Samsung kernel with a working public GhostLock root:
+  5.4, not 4.19.
 - [mobilehackinglab/ghostlock-a17](https://github.com/mobilehackinglab/ghostlock-a17) — Galaxy A17
   (6.12 GKI). Different endgame (workqueue forging to bypass Samsung KDP — irrelevant on 4.19,
   which has no KDP), but the best porting discipline and a **QEMU end-to-end validation harness**.
   Writeup: [mobilehackinglab.com](https://www.mobilehackinglab.com/blog/cve-2026-43499-ghostlock-a17-root-shell).
+- [Wtrwx/smt878u-ionstack-poc](https://github.com/Wtrwx/smt878u-ionstack-poc) — Tab S7 (SM-T878U,
+  4.19, same generation as this device). The only other public Samsung-4.19 GhostLock attempt
+  found (2026-10): **WIP, no root** — stuck earlier than this repo (the requeue race never lands,
+  ~470 runs). Useful companions: durable `write()+fsync()` log mirror under PANIC_ON_OOPS, and
+  honest negative-status README discipline.
+- [hmascs/KSuRoot](https://github.com/hmascs/KSuRoot) — Chinese one-click KSU tool: baselines
+  6.1/6.6/6.12 + ~122 vendor payloads (Samsung list sourced from the RMG feed, i.e. S22-era and
+  newer). No 4.19 baseline.
+- [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) — app lineage; maintainer
+  position on this device class: "not for Pre-GKI V2 devices (anything older than S22)"
+  ([issue #694](https://github.com/YuKongA/ghostlock-app/issues/694), a Galaxy S20 FE request —
+  same SM8250/4.19 generation as z3q).
 
 ### Target generators and adjacent tools
 - [woshimaniubi8/CVE-2026-43499-root-KernelSU](https://github.com/woshimaniubi8/CVE-2026-43499-root-KernelSU) —
